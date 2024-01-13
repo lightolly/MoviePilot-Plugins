@@ -6,38 +6,41 @@ import tempfile
 import time
 import traceback
 from datetime import timedelta
+from pathlib import Path
+from typing import Tuple, Dict, Any, List
 
 import iso639
 import psutil
 import srt
 from lxml import etree
 
-from app.helper import FfmpegHelper
-from app.helper.openai_helper import OpenAiHelper
-from app.plugins.modules._base import _IPluginModule
-from app.utils import SystemUtils
-from config import RMT_MEDIAEXT
+from app.core.config import settings
+from app.log import logger
+from app.plugins import _PluginBase
+from app.utils.system import SystemUtils
+from plugins.autosub.ffmpeg import Ffmpeg
+from plugins.autosub.translate.openai import OpenAi
 
 
-class AutoSub(_IPluginModule):
+class AutoSub(_PluginBase):
     # 插件名称
-    module_name = "AI字幕自动生成"
+    plugin_name = "AI字幕自动生成"
     # 插件描述
-    module_desc = "使用whisper自动生成视频文件字幕。"
+    plugin_desc = "使用whisper自动生成视频文件字幕。"
     # 插件图标
-    module_icon = "autosubtitles.jpeg"
+    plugin_icon = "autosubtitles.jpeg"
     # 主题色
-    module_color = "#2C4F7E"
+    plugin_color = "#2C4F7E"
     # 插件版本
-    module_version = "1.0"
+    plugin_version = "1.1"
     # 插件作者
-    module_author = "olly"
+    plugin_author = "olly"
     # 作者主页
     author_url = "https://github.com/lightolly"
     # 插件配置项ID前缀
-    module_config_prefix = "autosub"
+    plugin_config_prefix = "autosub"
     # 加载顺序
-    module_order = 14
+    plugin_order = 14
     # 可使用的用户级别
     auth_level = 2
 
@@ -46,22 +49,6 @@ class AutoSub(_IPluginModule):
     # 语句结束符
     _end_token = ['.', '!', '?', '。', '！', '？', '。"', '！"', '？"', '."', '!"', '?"']
     _noisy_token = [('(', ')'), ('[', ']'), ('{', '}'), ('【', '】'), ('♪', '♪'), ('♫', '♫'), ('♪♪', '♪♪')]
-
-    def __init__(self):
-        self.additional_args = '-t 4 -p 1'
-        self.translate_zh = False
-        self.translate_only = False
-        self.whisper_model = None
-        self.whisper_main = None
-        self.file_size = None
-        self.process_count = 0
-        self.skip_count = 0
-        self.fail_count = 0
-        self.success_count = 0
-        self.send_notify = False
-        self.asr_engine = 'whisper.cpp'
-        self.faster_whisper_model = 'base'
-        self.faster_whisper_model_path = None
 
     @staticmethod
     def get_fields():
@@ -281,10 +268,39 @@ class AutoSub(_IPluginModule):
         }
         """
 
-    def init_config(self, config=None):
+    def init_plugin(self, config=None):
+        self.additional_args = '-t 4 -p 1'
+        self.translate_zh = False
+        self.translate_only = False
+        self.whisper_model = None
+        self.whisper_main = None
+        self.file_size = None
+        self.process_count = 0
+        self.skip_count = 0
+        self.fail_count = 0
+        self.success_count = 0
+        self.send_notify = False
+        self.asr_engine = 'whisper.cpp'
+        self.faster_whisper_model = 'base'
+        self.faster_whisper_model_path = None
+
         # 如果没有配置信息， 则不处理
         if not config:
             return
+
+        # 获取自定义Hosts插件，若无设置则停止
+        chatgpt = self.get_config("ChatGPT")
+        self._chatgpt = chatgpt and chatgpt.get("enabled")
+        self._openai_key = chatgpt and chatgpt.get("openai_key")
+        self._openai_url = chatgpt and chatgpt.get("openai_url")
+        self._openai_proxy = chatgpt and chatgpt.get("proxy")
+        self._openai_model = chatgpt and chatgpt.get("model")
+        if self._openai_key and not chatgpt or not chatgpt.get("openai_key"):
+            logger.error(f"翻译依赖于ChatGPT，请先维护openai_key")
+            return
+        self.openai = OpenAi(api_key=self._openai_key, api_url=self._openai_url,
+                             proxy=settings.PROXY if self._openai_proxy else None,
+                             model=self._openai_model)
 
         # config.get('path_list') 用 \n 分割为 list 并去除重复值和空值
         path_list = list(set(config.get('path_list').split('\n')))
@@ -309,12 +325,12 @@ class AutoSub(_IPluginModule):
 
         # 如果没有配置信息， 则不处理
         if not path_list or not self.file_size:
-            self.warn(f"配置信息不完整，不进行处理")
+            logger.warn(f"配置信息不完整，不进行处理")
             return
 
         # 校验文件大小是否为数字
         if not self.file_size.isdigit():
-            self.warn(f"文件大小不是数字，不进行处理")
+            logger.warn(f"文件大小不是数字，不进行处理")
             return
 
         # asr 配置检查
@@ -322,7 +338,7 @@ class AutoSub(_IPluginModule):
             return
 
         if self._running:
-            self.warn(f"上一次任务还未完成，不进行处理")
+            logger.warn(f"上一次任务还未完成，不进行处理")
             return
 
         # 依次处理每个目录
@@ -330,61 +346,61 @@ class AutoSub(_IPluginModule):
             self._running = True
             self.success_count = self.skip_count = self.fail_count = self.process_count = 0
             for path in path_list:
-                self.info(f"开始处理目录：{path} ...")
+                logger.info(f"开始处理目录：{path} ...")
                 # 如果目录不存在， 则不处理
                 if not os.path.exists(path):
-                    self.warn(f"目录不存在，不进行处理")
+                    logger.warn(f"目录不存在，不进行处理")
                     continue
 
                 # 如果目录不是文件夹， 则不处理
                 if not os.path.isdir(path):
-                    self.warn(f"目录不是文件夹，不进行处理")
+                    logger.warn(f"目录不是文件夹，不进行处理")
                     continue
 
                 # 如果目录不是绝对路径， 则不处理
                 if not os.path.isabs(path):
-                    self.warn(f"目录不是绝对路径，不进行处理")
+                    logger.warn(f"目录不是绝对路径，不进行处理")
                     continue
 
                 # 处理目录
                 self.__process_folder_subtitle(path)
         except Exception as e:
-            self.error(f"处理异常: {e}")
+            logger.error(f"处理异常: {e}")
         finally:
-            self.info(f"处理完成: "
-                      f"成功{self.success_count} / 跳过{self.skip_count} / 失败{self.fail_count} / 共{self.process_count}")
+            logger.info(f"处理完成: "
+                        f"成功{self.success_count} / 跳过{self.skip_count} / 失败{self.fail_count} / 共{self.process_count}")
             self._running = False
 
     def __check_asr(self):
         if self.asr_engine == 'whisper.cpp':
             if not self.whisper_main or not self.whisper_model:
-                self.warn(f"配置信息不完整，不进行处理")
+                logger.warn(f"配置信息不完整，不进行处理")
                 return
             if not os.path.exists(self.whisper_main):
-                self.warn(f"whisper.cpp主程序不存在，不进行处理")
+                logger.warn(f"whisper.cpp主程序不存在，不进行处理")
                 return False
             if not os.path.exists(self.whisper_model):
-                self.warn(f"whisper.cpp模型文件不存在，不进行处理")
+                logger.warn(f"whisper.cpp模型文件不存在，不进行处理")
                 return False
             # 校验扩展参数是否包含异常字符
             if self.additional_args and re.search(r'[;|&]', self.additional_args):
-                self.warn(f"扩展参数包含异常字符，不进行处理")
+                logger.warn(f"扩展参数包含异常字符，不进行处理")
                 return False
         elif self.asr_engine == 'faster-whisper':
             if not self.faster_whisper_model_path or not self.faster_whisper_model:
-                self.warn(f"配置信息不完整，不进行处理")
+                logger.warn(f"配置信息不完整，不进行处理")
                 return
             if not os.path.exists(self.faster_whisper_model_path):
-                self.warn(f"faster-whisper模型文件夹不存在，不进行处理")
+                logger.warn(f"faster-whisper模型文件夹不存在，不进行处理")
                 return False
             try:
                 from faster_whisper import WhisperModel, download_model
             except ImportError:
-                self.warn(f"faster-whisper 未安装，不进行处理")
+                logger.warn(f"faster-whisper 未安装，不进行处理")
                 return False
             return True
         else:
-            self.warn(f"未配置asr引擎，不进行处理")
+            logger.warn(f"未配置asr引擎，不进行处理")
             return False
         return True
 
@@ -408,15 +424,15 @@ class AutoSub(_IPluginModule):
             file_name = os.path.basename(video_file)
 
             try:
-                self.info(f"开始处理文件：{video_file} ...")
+                logger.info(f"开始处理文件：{video_file} ...")
                 # 判断目的字幕（和内嵌）是否已存在
                 if self.__target_subtitle_exists(video_file):
-                    self.warn(f"字幕文件已经存在，不进行处理")
+                    logger.warn(f"字幕文件已经存在，不进行处理")
                     self.skip_count += 1
                     continue
                 # 生成字幕
                 if self.send_notify:
-                    self.send_message(title="自动字幕生成",
+                    self.post_message(title="自动字幕生成",
                                       text=f" 媒体: {file_name}\n 开始处理文件 ... ")
                 ret, lang = self.__generate_subtitle(video_file, file_path, self.translate_only)
                 if not ret:
@@ -429,33 +445,33 @@ class AutoSub(_IPluginModule):
                         self.fail_count += 1
 
                     if self.send_notify:
-                        self.send_message(title="自动字幕生成", text=message)
+                        self.post_message(title="自动字幕生成", text=message)
                     continue
 
                 if self.translate_zh:
                     # 翻译字幕
-                    self.info(f"开始翻译字幕为中文 ...")
+                    logger.info(f"开始翻译字幕为中文 ...")
                     if self.send_notify:
-                        self.send_message(title="自动字幕生成",
+                        self.post_message(title="自动字幕生成",
                                           text=f" 媒体: {file_name}\n 开始翻译字幕为中文 ... ")
                     self.__translate_zh_subtitle(lang, f"{file_path}.{lang}.srt", f"{file_path}.zh.srt")
-                    self.info(f"翻译字幕完成：{file_name}.zh.srt")
+                    logger.info(f"翻译字幕完成：{file_name}.zh.srt")
 
                 end_time = time.time()
                 message = f" 媒体: {file_name}\n 处理完成\n 字幕原始语言: {lang}\n "
                 if self.translate_zh:
                     message += f"字幕翻译语言: zh\n "
                 message += f"耗时：{round(end_time - start_time, 2)}秒"
-                self.info(f"自动字幕生成 处理完成：{message}")
+                logger.info(f"自动字幕生成 处理完成：{message}")
                 if self.send_notify:
-                    self.send_message(title="自动字幕生成", text=message)
+                    self.post_message(title="自动字幕生成", text=message)
                 self.success_count += 1
             except Exception as e:
-                self.error(f"自动字幕生成 处理异常：{e}")
+                logger.error(f"自动字幕生成 处理异常：{e}")
                 end_time = time.time()
                 message = f" 媒体: {file_name}\n 处理失败\n 耗时：{round(end_time - start_time, 2)}秒"
                 if self.send_notify:
-                    self.send_message(title="自动字幕生成", text=message)
+                    self.post_message(title="自动字幕生成", text=message)
                 # 打印调用栈
                 traceback.print_exc()
                 self.fail_count += 1
@@ -522,11 +538,11 @@ class AutoSub(_IPluginModule):
                 self.__save_srt(f"{audio_file}.srt", subs)
                 return True, lang
             except ImportError:
-                self.warn(f"faster-whisper 未安装，不进行处理")
+                logger.warn(f"faster-whisper 未安装，不进行处理")
                 return False, None
             except Exception as e:
                 traceback.print_exc()
-                self.error(f"faster-whisper 处理异常：{e}")
+                logger.error(f"faster-whisper 处理异常：{e}")
                 return False, None
         return False, None
 
@@ -538,9 +554,9 @@ class AutoSub(_IPluginModule):
         :return: 生成成功返回True，字幕语言，否则返回False, None
         """
         # 获取文件元数据
-        video_meta = FfmpegHelper().get_video_metadata(video_file)
+        video_meta = Ffmpeg().get_video_metadata(video_file)
         if not video_meta:
-            self.error(f"获取视频文件元数据失败，跳过后续处理")
+            logger.error(f"获取视频文件元数据失败，跳过后续处理")
             return False, None
 
         # 获取视频文件音轨和语言信息
@@ -549,40 +565,40 @@ class AutoSub(_IPluginModule):
             return False, None
 
         if not iso639.find(audio_lang) or not iso639.to_iso639_1(audio_lang):
-            self.info(f"未知语言音轨")
+            logger.info(f"未知语言音轨")
             audio_lang = 'auto'
 
         expert_subtitle_langs = ['en', 'eng'] if audio_lang == 'auto' else [audio_lang, iso639.to_iso639_1(audio_lang)]
-        self.info(f"使用 {expert_subtitle_langs} 匹配已有外挂字幕文件 ...")
+        logger.info(f"使用 {expert_subtitle_langs} 匹配已有外挂字幕文件 ...")
 
         exist, lang = self.__external_subtitle_exists(video_file, expert_subtitle_langs)
         if exist:
-            self.info(f"外挂字幕文件已经存在，字幕语言 {lang}")
+            logger.info(f"外挂字幕文件已经存在，字幕语言 {lang}")
             return True, iso639.to_iso639_1(lang)
 
-        self.info(f"外挂字幕文件不存在，使用 {expert_subtitle_langs} 匹配内嵌字幕文件 ...")
+        logger.info(f"外挂字幕文件不存在，使用 {expert_subtitle_langs} 匹配内嵌字幕文件 ...")
         # 获取视频文件字幕信息
         ret, subtitle_index, \
             subtitle_lang, subtitle_count = self.__get_video_prefer_subtitle(video_meta, expert_subtitle_langs)
         if ret and (audio_lang == subtitle_lang or subtitle_count == 1):
             if audio_lang == subtitle_lang:
                 # 如果音轨和字幕语言一致， 则直接提取字幕
-                self.info(f"内嵌音轨和字幕语言一致，直接提取字幕 ...")
+                logger.info(f"内嵌音轨和字幕语言一致，直接提取字幕 ...")
             elif subtitle_count == 1:
                 # 如果音轨和字幕语言不一致，但只有一个字幕， 则直接提取字幕
-                self.info(f"内嵌音轨和字幕语言不一致，但只有一个字幕，直接提取字幕 ...")
+                logger.info(f"内嵌音轨和字幕语言不一致，但只有一个字幕，直接提取字幕 ...")
 
             audio_lang = iso639.to_iso639_1(subtitle_lang) \
                 if (iso639.find(subtitle_lang) and iso639.to_iso639_1(subtitle_lang)) else 'und'
-            FfmpegHelper().extract_subtitle_from_video(video_file, f"{subtitle_file}.{audio_lang}.srt", subtitle_index)
-            self.info(f"提取字幕完成：{subtitle_file}.{audio_lang}.srt")
+            Ffmpeg().extract_subtitle_from_video(video_file, f"{subtitle_file}.{audio_lang}.srt", subtitle_index)
+            logger.info(f"提取字幕完成：{subtitle_file}.{audio_lang}.srt")
             return True, audio_lang
 
         if audio_lang != 'auto':
             audio_lang = iso639.to_iso639_1(audio_lang)
 
         if only_extract:
-            self.info(f"未开启语音识别，且无已有字幕文件，跳过后续处理")
+            logger.info(f"未开启语音识别，且无已有字幕文件，跳过后续处理")
             return False, None
 
         # 清理异常退出的临时文件
@@ -593,23 +609,23 @@ class AutoSub(_IPluginModule):
 
         with tempfile.NamedTemporaryFile(prefix='autosub-', suffix='.wav', delete=True) as audio_file:
             # 提取音频
-            self.info(f"提取音频：{audio_file.name} ...")
-            FfmpegHelper().extract_wav_from_video(video_file, audio_file.name, audio_index)
-            self.info(f"提取音频完成：{audio_file.name}")
+            logger.info(f"提取音频：{audio_file.name} ...")
+            Ffmpeg().extract_wav_from_video(video_file, audio_file.name, audio_index)
+            logger.info(f"提取音频完成：{audio_file.name}")
 
             # 生成字幕
-            self.info(f"开始生成字幕, 语言 {audio_lang} ...")
+            logger.info(f"开始生成字幕, 语言 {audio_lang} ...")
             ret, lang = self.__do_speech_recognition(audio_lang, audio_file.name)
             if ret:
-                self.info(f"生成字幕成功，原始语言：{lang}")
+                logger.info(f"生成字幕成功，原始语言：{lang}")
                 # 复制字幕文件
-                SystemUtils.copy(f"{audio_file.name}.srt", f"{subtitle_file}.{lang}.srt")
-                self.info(f"复制字幕文件：{subtitle_file}.{lang}.srt")
+                SystemUtils.copy(Path(f"{audio_file.name}.srt"), Path(f"{subtitle_file}.{lang}.srt"))
+                logger.info(f"复制字幕文件：{subtitle_file}.{lang}.srt")
                 # 删除临时文件
                 os.remove(f"{audio_file.name}.srt")
                 return ret, lang
             else:
-                self.error(f"生成字幕失败")
+                logger.error(f"生成字幕失败")
                 return False, None
 
     @staticmethod
@@ -629,7 +645,7 @@ class AutoSub(_IPluginModule):
             for file in files:
                 cur_path = os.path.join(root, file)
                 # 检查后缀
-                if os.path.splitext(file)[-1].lower() in RMT_MEDIAEXT:
+                if os.path.splitext(file)[-1].lower() in settings.RMT_MEDIAEXT:
                     yield cur_path
 
     @staticmethod
@@ -683,10 +699,10 @@ class AutoSub(_IPluginModule):
 
         # 如果没有音轨， 则不处理
         if audio_index is None:
-            self.warn(f"没有音轨，不进行处理")
+            logger.warn(f"没有音轨，不进行处理")
             return False, None, None
 
-        self.info(f"选中音轨信息：{audio_index}, {audio_lang}")
+        logger.info(f"选中音轨信息：{audio_index}, {audio_lang}")
         return True, audio_index, audio_lang
 
     def __get_video_prefer_subtitle(self, video_meta, prefer_lang=None):
@@ -759,10 +775,10 @@ class AutoSub(_IPluginModule):
 
         # 如果没有字幕， 则不处理
         if subtitle_index is None:
-            self.debug(f"没有内嵌字幕")
+            logger.debug(f"没有内嵌字幕")
             return False, None, None, None
 
-        self.debug(f"命中内嵌字幕信息：{subtitle_index}, {subtitle_lang}")
+        logger.debug(f"命中内嵌字幕信息：{subtitle_index}, {subtitle_lang}")
         return True, subtitle_index, subtitle_lang, subtitle_count
 
     def __is_noisy_subtitle(self, content):
@@ -824,16 +840,16 @@ class AutoSub(_IPluginModule):
     def __do_translate_with_retry(self, text, retry=3):
         # 调用OpenAI翻译
         # 免费OpenAI Api Limit: 20 / minute
-        ret, result = OpenAiHelper().translate_to_zh(text)
+        ret, result = OpenAi().translate_to_zh(text)
         for i in range(retry):
             if ret and result:
                 break
             if "Rate limit reached" in result:
-                self.info(f"OpenAI Api Rate limit reached, sleep 60s ...")
+                logger.info(f"OpenAI Api Rate limit reached, sleep 60s ...")
                 time.sleep(60)
             else:
-                self.warn(f"翻译失败，重试第{i + 1}次")
-            ret, result = OpenAiHelper().translate_to_zh(text)
+                logger.warn(f"翻译失败，重试第{i + 1}次")
+            ret, result = OpenAi().translate_to_zh(text)
 
         if not ret or not result:
             return None
@@ -851,9 +867,9 @@ class AutoSub(_IPluginModule):
         srt_data = self.__load_srt(source_subtitle)
         # 合并字幕语句，目前带标点带英文效果较好，非英文或者无标点的需要NLP处理
         if source_lang in ['en', 'eng']:
-            self.info(f"开始合并字幕语句 ...")
+            logger.info(f"开始合并字幕语句 ...")
             merged_data = self.__merge_srt(srt_data)
-            self.info(f"合并字幕语句完成，合并前字幕数量：{len(srt_data)}, 合并后字幕数量：{len(merged_data)}")
+            logger.info(f"合并字幕语句完成，合并前字幕数量：{len(srt_data)}, 合并后字幕数量：{len(merged_data)}")
             srt_data = merged_data
 
         batch = []
@@ -882,7 +898,7 @@ class AutoSub(_IPluginModule):
 
             translated = result.split('\n')
             if len(translated) != len(batch):
-                self.info(
+                logger.info(
                     f"翻译结果数量不匹配，翻译结果数量：{len(translated)}, 需要翻译数量：{len(batch)}, 退化为单条翻译 ...")
                 # 如果翻译结果数量不匹配，则退化为单条翻译
                 for index, item in enumerate(batch):
@@ -891,7 +907,7 @@ class AutoSub(_IPluginModule):
                         continue
                     item.content = result + '\n' + item.content
             else:
-                self.debug(f"翻译结果数量匹配，翻译结果数量：{len(translated)}")
+                logger.debug(f"翻译结果数量匹配，翻译结果数量：{len(translated)}")
                 for index, item in enumerate(batch):
                     item.content = translated[index].strip() + '\n' + item.content
 
@@ -935,7 +951,7 @@ class AutoSub(_IPluginModule):
         if exist:
             return True
 
-        video_meta = FfmpegHelper().get_video_metadata(video_file)
+        video_meta = Ffmpeg().get_video_metadata(video_file)
         if not video_meta:
             return False
         ret, subtitle_index, subtitle_lang, _ = self.__get_video_prefer_subtitle(video_meta, prefer_lang=prefer_langs)
@@ -943,6 +959,247 @@ class AutoSub(_IPluginModule):
             return True
 
         return False
+
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """
+        拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
+        """
+        return [
+            {
+                'component': 'VForm',
+                'content': [
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'enabled',
+                                            'label': '启用插件',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'notify',
+                                            'label': '发送通知',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'onlyonce',
+                                            'label': '立即运行一次',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'mode',
+                                            'label': '监控模式',
+                                            'items': [
+                                                {'title': '兼容模式', 'value': 'compatibility'},
+                                                {'title': '性能模式', 'value': 'fast'}
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'transfer_type',
+                                            'label': '转移方式',
+                                            'items': [
+                                                {'title': '移动', 'value': 'move'},
+                                                {'title': '复制', 'value': 'copy'},
+                                                {'title': '硬链接', 'value': 'link'},
+                                                {'title': '软链接', 'value': 'softlink'},
+                                                {'title': 'Rclone复制', 'value': 'rclone_copy'},
+                                                {'title': 'Rclone移动', 'value': 'rclone_move'}
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'interval',
+                                            'label': '入库消息延迟',
+                                            'placeholder': '10'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'cron',
+                                            'label': '定时全量同步周期',
+                                            'placeholder': '5位cron表达式，留空关闭'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'monitor_dirs',
+                                            'label': '监控目录',
+                                            'rows': 5,
+                                            'placeholder': '每一行一个目录，支持以下几种配置方式，转移方式支持 move、copy、link、softlink、rclone_copy、rclone_move：\n'
+                                                           '监控目录\n'
+                                                           '监控目录#转移方式\n'
+                                                           '监控目录:转移目的目录\n'
+                                                           '监控目录:转移目的目录#转移方式'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'exclude_keywords',
+                                            'label': '排除关键词',
+                                            'rows': 2,
+                                            'placeholder': '每一行一个关键词'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '入库消息延迟默认10s，如网络较慢可酌情调大，有助于发送统一入库消息。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        ], {
+            "enabled": False,
+            "notify": False,
+            "onlyonce": False,
+            "mode": "fast",
+            "transfer_type": settings.TRANSFER_TYPE,
+            "monitor_dirs": "",
+            "exclude_keywords": "",
+            "interval": 10,
+            "cron": ""
+        }
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        pass
+
+    def get_page(self) -> List[dict]:
+        pass
+
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        pass
 
     def get_state(self):
         return False
