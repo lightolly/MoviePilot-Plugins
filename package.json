@@ -2,7 +2,7 @@
       "AutoSub": {
         "name": "AI字幕自动生成",
         "description": "使用whisper自动生成视频文件字幕。",
-        "version": "1.0",
+        "version": "0.6",
         "icon": "autosubtitles.jpeg",
         "author": "lightolly",
         "level": 1

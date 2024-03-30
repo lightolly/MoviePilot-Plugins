@@ -5,13 +5,15 @@ import subprocess
 import tempfile
 import time
 import traceback
-from datetime import timedelta
+from datetime import timedelta, datetime
 from pathlib import Path
 from typing import Tuple, Dict, Any, List
 
 import iso639
 import psutil
+import pytz
 import srt
+from apscheduler.schedulers.background import BackgroundScheduler
 from lxml import etree
 
 from app.core.config import settings
@@ -32,7 +34,7 @@ class AutoSub(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.1"
+    plugin_version = "0.6"
     # 插件作者
     plugin_author = "olly"
     # 作者主页
@@ -50,223 +52,30 @@ class AutoSub(_PluginBase):
     _end_token = ['.', '!', '?', '。', '！', '？', '。"', '！"', '？"', '."', '!"', '?"']
     _noisy_token = [('(', ')'), ('[', ']'), ('{', '}'), ('【', '】'), ('♪', '♪'), ('♫', '♫'), ('♪♪', '♪♪')]
 
-    @staticmethod
-    def get_fields():
-        return [
-            # 同一板块
-            {
-                'type': 'div',
-                'content': [
-                    [
-                        {
-                            'title': '媒体路径',
-                            'required': '',
-                            'tooltip': '要进行字幕生成的路径，每行一个路径，请确保路径正确',
-                            'type': 'textarea',
-                            'content':
-                                {
-                                    'id': 'path_list',
-                                    'placeholder': '文件路径',
-                                    'rows': 5
-                                }
-                        }
-                    ],
-                    # asr 引擎
-                    [
-                        {
-                            'title': '文件大小（MB）',
-                            'required': "required",
-                            'tooltip': '单位 MB, 大于该大小的文件才会进行字幕生成',
-                            'type': 'text',
-                            'content':
-                                [{
-                                    'id': 'file_size',
-                                    'placeholder': '文件大小, 单位MB'
-                                }]
-                        },
-                        {
-                            'title': 'ASR引擎',
-                            'required': "required",
-                            'tooltip': '自动语音识别引擎选择',
-                            'type': 'select',
-                            'content': [
-                                {
-                                    'id': 'asr_engine',
-                                    'options': {
-                                        'whisper.cpp': 'whisper.cpp',
-                                        'faster-whisper': 'faster-whisper'
-                                    },
-                                    'default': 'whisper.cpp',
-                                    'onchange': 'AutoSub_asr_engine_change(this)'
-                                }
-                            ]
-                        }
-                    ]
-                ]
-            },
-            {
-                'type': 'details',
-                'id': 'whisper_config',
-                'summary': 'whisper.cpp 配置',
-                'tooltip': '使用 whisper.cpp 引擎时的配置',
-                'hidden': False,
-                'content': [
-                    [
-                        {
-                            'title': 'whisper.cpp路径',
-                            'required': "",
-                            'tooltip': '填写whisper.cpp主程序路径，如/config/plugin/autosub/main \n'
-                                       '推荐教程 https://ddsrem.com/autosub',
-                            'type': 'text',
-                            'content': [
-                                {
-                                    'id': 'whisper_main',
-                                    'placeholder': 'whisper.cpp主程序路径'
-                                }
-                            ]
-                        }
-                    ],
-                    [
-                        {
-                            'title': 'whisper.cpp模型路径',
-                            'required': "",
-                            'tooltip': '填写whisper.cpp模型路径，如/config/plugin/autosub/models/ggml-base.en.bin\n'
-                                       '可从https://github.com/ggerganov/whisper.cpp/tree/master/models处下载',
-                            'type': 'text',
-                            'content':
-                                [{
-                                    'id': 'whisper_model',
-                                    'placeholder': 'whisper.cpp模型路径'
-                                }]
-                        }
-                    ],
-                    [
-                        {
-                            'title': '高级参数',
-                            'tooltip': 'whisper.cpp的高级参数，请勿随意修改',
-                            'required': "",
-                            'type': 'text',
-                            'content': [
-                                {
-                                    'id': 'additional_args',
-                                    'placeholder': '-t 4 -p 1'
-                                }
-                            ]
-                        }
-                    ]
-                ]
-            },
-            {
-                'type': 'details',
-                'id': 'faster_whisper_config',
-                'summary': 'faster-whisper 配置',
-                'tooltip': '使用 faster-whisper 引擎时的配置，安装参考 https://github.com/guillaumekln/faster-whisper',
-                'content': [
-                    [
-                        {
-                            'title': '模型',
-                            'required': "",
-                            'tooltip': '选择模型后第一次运行会从Hugging Face Hub下载模型，可能需要一段时间',
-                            'type': 'select',
-                            'content': [
-                                {
-                                    'id': 'faster_whisper_model',
-                                    'options': {
-                                        # tiny, tiny.en, base, base.en,
-                                        # small, small.en, medium, medium.en,
-                                        # large-v1, or large-v2
-                                        'tiny': 'tiny',
-                                        'tiny.en': 'tiny.en',
-                                        'base': 'base',
-                                        'base.en': 'base.en',
-                                        'small': 'small',
-                                        'small.en': 'small.en',
-                                        'medium': 'medium',
-                                        'medium.en': 'medium.en',
-                                        'large-v1': 'large-v1',
-                                        'large-v2': 'large-v2',
-                                    },
-                                    'default': 'base'
-                                }
-                            ]
-                        }
-                    ],
-                    [
-                        {
-                            'title': '模型保存路径',
-                            'required': "",
-                            'tooltip': '配置模型保存路径，如/config/plugin/autosub/faster-whisper/models',
-                            'type': 'text',
-                            'content': [
-                                {
-                                    'id': 'faster_whisper_model_path',
-                                    'placeholder': 'faster-whisper配置模型保存路径'
-                                }
-                            ]
-                        }
-                    ]
-                ]
-            },
-            {
-                'type': 'div',
-                'content': [
-                    [
-                        {
-                            'title': '立即运行一次',
-                            'required': "",
-                            'tooltip': '打开后立即运行一次',
-                            'type': 'switch',
-                            'id': 'run_now',
-                        },
-                        {
-                            'title': '翻译为中文',
-                            'required': "",
-                            'tooltip': '打开后将自动翻译非中文字幕，生成双语字幕，关闭后只生成英文字幕，需要配置OpenAI API Key',
-                            'type': 'switch',
-                            'id': 'translate_zh',
-                        },
-                        {
-                            'title': '仅已有字幕翻译',
-                            'required': "",
-                            'tooltip': '打开后仅翻译已有字幕，不做语音识别，关闭后将自动识别语音并生成字幕',
-                            'type': 'switch',
-                            'id': 'translate_only',
-                        }
-                    ],
-                    [
-                        {
-                            'title': '运行时通知',
-                            'required': "",
-                            'tooltip': '打开后将在单个字幕生成开始和完成后发送通知, 需要开启插件消息推送通知',
-                            'type': 'switch',
-                            'id': 'send_notify',
-                        }
-                    ]
-                ]
-            }
-        ]
-
-    @staticmethod
-    def get_script():
-        """
-        返回插件额外的JS代码
-        """
-        return """
-        function AutoSub_asr_engine_change(obj) {
-            if ($(obj).val() == 'faster-whisper') {
-                $('#autosubwhisper_config').hide();
-                $('#autosubfaster_whisper_config').show();
-            }else{
-                $('#autosubwhisper_config').show();
-                $('#autosubfaster_whisper_config').hide();
-            }
-        }
-
-        // 初始化完成后执行的方法
-        function AutoSub_PluginInit(){
-            AutoSub_asr_engine_change('#autosubasr_engine');
-        }
-        """
+    def __init__(self):
+        super().__init__()
+        # ChatGPT
+        self.openai = None
+        self._chatgpt = None
+        self._openai_key = None
+        self._openai_url = None
+        self._openai_proxy = None
+        self._openai_model = None
+        self._scheduler = None
+        self.process_count = None
+        self.fail_count = None
+        self.success_count = None
+        self.skip_count = None
+        self.faster_whisper_model_path = None
+        self.faster_whisper_model = None
+        self.asr_engine = None
+        self.send_notify = None
+        self.additional_args = None
+        self.translate_only = None
+        self.translate_zh = None
+        self.whisper_model = None
+        self.whisper_main = None
+        self.file_size = None
 
     def init_plugin(self, config=None):
         self.additional_args = '-t 4 -p 1'
@@ -288,19 +97,23 @@ class AutoSub(_PluginBase):
         if not config:
             return
 
-        # 获取自定义Hosts插件，若无设置则停止
-        chatgpt = self.get_config("ChatGPT")
-        self._chatgpt = chatgpt and chatgpt.get("enabled")
-        self._openai_key = chatgpt and chatgpt.get("openai_key")
-        self._openai_url = chatgpt and chatgpt.get("openai_url")
-        self._openai_proxy = chatgpt and chatgpt.get("proxy")
-        self._openai_model = chatgpt and chatgpt.get("model")
-        if self._openai_key and not chatgpt or not chatgpt.get("openai_key"):
-            logger.error(f"翻译依赖于ChatGPT，请先维护openai_key")
-            return
-        self.openai = OpenAi(api_key=self._openai_key, api_url=self._openai_url,
-                             proxy=settings.PROXY if self._openai_proxy else None,
-                             model=self._openai_model)
+        self.translate_zh = config.get('translate_zh', False)
+        if self.translate_zh:
+            chatgpt = self.get_config("ChatGPT")
+            if not chatgpt:
+                logger.error(f"翻译依赖于ChatGPT，请先维护ChatGPT插件")
+                return
+            self._chatgpt = chatgpt and chatgpt.get("enabled")
+            self._openai_key = chatgpt and chatgpt.get("openai_key")
+            self._openai_url = chatgpt and chatgpt.get("openai_url")
+            self._openai_proxy = chatgpt and chatgpt.get("proxy")
+            self._openai_model = chatgpt and chatgpt.get("model")
+            if not self._openai_key:
+                logger.error(f"翻译依赖于ChatGPT，请先维护openai_key")
+                return
+            self.openai = OpenAi(api_key=self._openai_key, api_url=self._openai_url,
+                                 proxy=settings.PROXY if self._openai_proxy else None,
+                                 model=self._openai_model)
 
         # config.get('path_list') 用 \n 分割为 list 并去除重复值和空值
         path_list = list(set(config.get('path_list').split('\n')))
@@ -308,13 +121,13 @@ class AutoSub(_PluginBase):
         self.file_size = config.get('file_size')
         self.whisper_main = config.get('whisper_main')
         self.whisper_model = config.get('whisper_model')
-        self.translate_zh = config.get('translate_zh', False)
         self.translate_only = config.get('translate_only', False)
         self.additional_args = config.get('additional_args', '-t 4 -p 1')
         self.send_notify = config.get('send_notify', False)
-        self.asr_engine = config.get('asr_engine', 'whisper.cpp')
+        self.asr_engine = config.get('asr_engine', 'faster_whisper')
         self.faster_whisper_model = config.get('faster_whisper_model', 'base')
-        self.faster_whisper_model_path = config.get('faster_whisper_model_path')
+        self.faster_whisper_model_path = config.get('faster_whisper_model_path',
+                                                    self.get_data_path() / "faster-whisper-models")
 
         run_now = config.get('run_now')
         if not run_now:
@@ -341,6 +154,20 @@ class AutoSub(_PluginBase):
             logger.warn(f"上一次任务还未完成，不进行处理")
             return
 
+        if run_now:
+            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+            logger.info("AI字幕自动生成任务，立即运行一次")
+            self._scheduler.add_job(func=self._do_autosub, kwargs={'path_list': path_list}, trigger='date',
+                                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                                    name="AI字幕自动生成")
+
+            # 启动任务
+            if self._scheduler.get_jobs():
+                self._scheduler.print_jobs()
+                self._scheduler.start()
+
+
+    def _do_autosub(self, path_list: str):
         # 依次处理每个目录
         try:
             self._running = True
@@ -391,8 +218,8 @@ class AutoSub(_PluginBase):
                 logger.warn(f"配置信息不完整，不进行处理")
                 return
             if not os.path.exists(self.faster_whisper_model_path):
-                logger.warn(f"faster-whisper模型文件夹不存在，不进行处理")
-                return False
+                logger.info(f"创建faster-whisper模型目录：{self.faster_whisper_model_path}")
+                os.mkdir(self.faster_whisper_model_path)
             try:
                 from faster_whisper import WhisperModel, download_model
             except ImportError:
@@ -505,12 +332,13 @@ class AutoSub(_PluginBase):
                 cache_dir = os.path.join(self.faster_whisper_model_path, "cache")
                 if not os.path.exists(cache_dir):
                     os.mkdir(cache_dir)
-                os.environ["HUGGINGFACE_HUB_CACHE"] = cache_dir
-                model = WhisperModel(download_model(self.faster_whisper_model),
+                os.environ["HF_HUB_CACHE"] = cache_dir
+                model = WhisperModel(download_model(self.faster_whisper_model, cache_dir=cache_dir),
                                      device="cpu", compute_type="int8", cpu_threads=psutil.cpu_count(logical=False))
                 segments, info = model.transcribe(audio_file,
                                                   language=lang if lang != 'auto' else None,
                                                   word_timestamps=True,
+                                                  vad_filter=True,
                                                   temperature=0,
                                                   beam_size=5)
                 if lang == 'auto':
@@ -589,7 +417,7 @@ class AutoSub(_PluginBase):
                 logger.info(f"内嵌音轨和字幕语言不一致，但只有一个字幕，直接提取字幕 ...")
 
             audio_lang = iso639.to_iso639_1(subtitle_lang) \
-                if (iso639.find(subtitle_lang) and iso639.to_iso639_1(subtitle_lang)) else 'und'
+                if (subtitle_lang and iso639.find(subtitle_lang) and iso639.to_iso639_1(subtitle_lang)) else 'und'
             Ffmpeg().extract_subtitle_from_video(video_file, f"{subtitle_file}.{audio_lang}.srt", subtitle_index)
             logger.info(f"提取字幕完成：{subtitle_file}.{audio_lang}.srt")
             return True, audio_lang
@@ -741,7 +569,7 @@ class AutoSub(_PluginBase):
             'hdmv_pgs_subtitle',
         )
 
-        if type(prefer_lang) == str and prefer_lang:
+        if prefer_lang is str and prefer_lang:
             prefer_lang = [prefer_lang]
 
         # 获取首选字幕
@@ -840,16 +668,17 @@ class AutoSub(_PluginBase):
     def __do_translate_with_retry(self, text, retry=3):
         # 调用OpenAI翻译
         # 免费OpenAI Api Limit: 20 / minute
-        ret, result = OpenAi().translate_to_zh(text)
+        openai = OpenAi(self._openai_key, self._openai_url, self._openai_proxy, self._openai_model)
+        ret, result = openai.translate_to_zh(text)
         for i in range(retry):
             if ret and result:
                 break
-            if "Rate limit reached" in result:
+            if "Rate limit reached" in result or "Rate limit exceeded" in result:
                 logger.info(f"OpenAI Api Rate limit reached, sleep 60s ...")
                 time.sleep(60)
             else:
                 logger.warn(f"翻译失败，重试第{i + 1}次")
-            ret, result = OpenAi().translate_to_zh(text)
+            ret, result = openai.translate_to_zh(text)
 
         if not ret or not result:
             return None
@@ -997,7 +826,7 @@ class AutoSub(_PluginBase):
                                     {
                                         'component': 'VSwitch',
                                         'props': {
-                                            'model': 'notify',
+                                            'model': 'send_notify',
                                             'label': '发送通知',
                                         }
                                     }
@@ -1013,7 +842,7 @@ class AutoSub(_PluginBase):
                                     {
                                         'component': 'VSwitch',
                                         'props': {
-                                            'model': 'onlyonce',
+                                            'model': 'run_now',
                                             'label': '立即运行一次',
                                         }
                                     }
@@ -1028,17 +857,16 @@ class AutoSub(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
                                         'component': 'VSelect',
                                         'props': {
-                                            'model': 'mode',
-                                            'label': '监控模式',
+                                            'model': 'asr_engine',
+                                            'label': 'ASR引擎',
                                             'items': [
-                                                {'title': '兼容模式', 'value': 'compatibility'},
-                                                {'title': '性能模式', 'value': 'fast'}
+                                                {'title': 'faster-whisper', 'value': 'faster-whisper'}
                                             ]
                                         }
                                     }
@@ -1048,21 +876,29 @@ class AutoSub(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
                                         'component': 'VSelect',
                                         'props': {
-                                            'model': 'transfer_type',
-                                            'label': '转移方式',
+                                            'model': 'faster_whisper_model',
+                                            'label': '模型',
                                             'items': [
-                                                {'title': '移动', 'value': 'move'},
-                                                {'title': '复制', 'value': 'copy'},
-                                                {'title': '硬链接', 'value': 'link'},
-                                                {'title': '软链接', 'value': 'softlink'},
-                                                {'title': 'Rclone复制', 'value': 'rclone_copy'},
-                                                {'title': 'Rclone移动', 'value': 'rclone_move'}
+                                                {'title': 'tiny', 'value': 'tiny'},
+                                                {'title': 'tiny.en', 'value': 'tiny.en'},
+                                                {'title': 'base', 'value': 'base'},
+                                                {'title': 'base.en', 'value': 'base.en'},
+                                                {'title': 'small', 'value': 'small'},
+                                                {'title': 'small.en', 'value': 'small.en'},
+                                                {'title': 'medium', 'value': 'medium'},
+                                                {'title': 'large-v1', 'value': 'large-v1'},
+                                                {'title': 'large-v2', 'value': 'large-v2'},
+                                                {'title': 'large-v3', 'value': 'large-v3'},
+                                                {'title': 'distil-small.en', 'value': 'distil-small.en'},
+                                                {'title': 'distil-medium.en', 'value': 'distil-medium.en'},
+                                                {'title': 'distil-large-v2.en', 'value': 'distil-large-v2'},
+                                                {'title': 'distil-large-v3.en', 'value': 'distil-large-v3'},
                                             ]
                                         }
                                     }
@@ -1072,36 +908,30 @@ class AutoSub(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
-                                        'component': 'VTextField',
+                                        'component': 'VSwitch',
                                         'props': {
-                                            'model': 'interval',
-                                            'label': '入库消息延迟',
-                                            'placeholder': '10'
+                                            'model': 'translate_zh',
+                                            'label': '翻译为中文',
                                         }
                                     }
                                 ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
+                            },
                             {
                                 'component': 'VCol',
                                 'props': {
-                                    'cols': 12
+                                    'cols': 12,
+                                    'md': 3
                                 },
                                 'content': [
                                     {
-                                        'component': 'VTextField',
+                                        'component': 'VSwitch',
                                         'props': {
-                                            'model': 'cron',
-                                            'label': '定时全量同步周期',
-                                            'placeholder': '5位cron表达式，留空关闭'
+                                            'model': 'translate_only',
+                                            'label': '仅已有字幕翻译',
                                         }
                                     }
                                 ]
@@ -1120,14 +950,10 @@ class AutoSub(_PluginBase):
                                     {
                                         'component': 'VTextarea',
                                         'props': {
-                                            'model': 'monitor_dirs',
-                                            'label': '监控目录',
+                                            'model': 'path_list',
+                                            'label': '媒体路径',
                                             'rows': 5,
-                                            'placeholder': '每一行一个目录，支持以下几种配置方式，转移方式支持 move、copy、link、softlink、rclone_copy、rclone_move：\n'
-                                                           '监控目录\n'
-                                                           '监控目录#转移方式\n'
-                                                           '监控目录:转移目的目录\n'
-                                                           '监控目录:转移目的目录#转移方式'
+                                            'placeholder': '要进行字幕生成的路径，每行一个路径，请确保路径正确'
                                         }
                                     }
                                 ]
@@ -1144,12 +970,11 @@ class AutoSub(_PluginBase):
                                 },
                                 'content': [
                                     {
-                                        'component': 'VTextarea',
+                                        'component': 'VTextField',
                                         'props': {
-                                            'model': 'exclude_keywords',
-                                            'label': '排除关键词',
-                                            'rows': 2,
-                                            'placeholder': '每一行一个关键词'
+                                            'model': 'file_size',
+                                            'label': '文件大小（MB）',
+                                            'placeholder': '单位 MB, 大于该大小的文件才会进行字幕生成'
                                         }
                                     }
                                 ]
@@ -1170,7 +995,7 @@ class AutoSub(_PluginBase):
                                         'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
-                                            'text': '入库消息延迟默认10s，如网络较慢可酌情调大，有助于发送统一入库消息。'
+                                            'text': '翻译依赖 OpenAi 插件配置'
                                         }
                                     }
                                 ]
@@ -1181,14 +1006,14 @@ class AutoSub(_PluginBase):
             }
         ], {
             "enabled": False,
-            "notify": False,
-            "onlyonce": False,
-            "mode": "fast",
-            "transfer_type": settings.TRANSFER_TYPE,
-            "monitor_dirs": "",
-            "exclude_keywords": "",
-            "interval": 10,
-            "cron": ""
+            "send_notify": False,
+            "run_now": False,
+            "asr_engine": "faster-whisper",
+            "faster_whisper_model": "base",
+            "translate_zh": True,
+            "translate_only": False,
+            "path_list": "",
+            "file_size": "10",
         }
 
     def get_api(self) -> List[Dict[str, Any]]:
@@ -1201,11 +1026,17 @@ class AutoSub(_PluginBase):
     def get_command() -> List[Dict[str, Any]]:
         pass
 
-    def get_state(self):
-        return False
+    def get_state(self) -> bool:
+        """
+        获取插件状态，如果插件正在运行， 则返回True
+        """
+        return self._running
 
     def stop_service(self):
         """
         退出插件
         """
-        pass
+        if self._running:
+            self._running = False
+            self._scheduler.shutdown()
+            logger.info(f"停止自动字幕生成服务")
