@@ -166,7 +166,6 @@ class AutoSub(_PluginBase):
                 self._scheduler.print_jobs()
                 self._scheduler.start()
 
-
     def _do_autosub(self, path_list: str):
         # 依次处理每个目录
         try:
@@ -678,6 +677,7 @@ class AutoSub(_PluginBase):
                 time.sleep(60)
             else:
                 logger.warn(f"翻译失败，重试第{i + 1}次")
+                time.sleep(2 * (i + 1))
             ret, result = openai.translate_to_zh(text)
 
         if not ret or not result:
